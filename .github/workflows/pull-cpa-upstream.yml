@@ -1,0 +1,341 @@
+name: Pull CPA Upstream Latest Tag
+
+on:
+  schedule:
+    # 每天 UTC 19:00 运行（北京时间 凌晨 03:00）
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "导入到当前仓库的目标分支"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pull-cpa-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: router-for-me/CLIProxyAPI
+  WORKFLOW_FILE: .github/workflows/pull-cpa-upstream.yml
+
+jobs:
+  pull-upstream:
+    name: Pull CPA latest tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+
+      - name: Random delay for scheduled run
+        if: github.event_name == 'schedule'
+        run: |
+          DELAY=$((RANDOM % 1800))
+          echo "定时任务随机等待 ${DELAY} 秒..."
+          sleep ${DELAY}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve latest upstream tag
+        id: resolve_tag
+        run: |
+          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
+
+          echo "开始查询上游仓库最新 tag: ${UPSTREAM_REPO}"
+
+          LATEST_TAG="$(git ls-remote --tags --refs "${UPSTREAM_URL}" \
+            | awk '{ print $2 }' \
+            | sed 's#refs/tags/##' \
+            | sort -V \
+            | tail -n 1)"
+
+          if [ -z "${LATEST_TAG}" ]; then
+            echo "❌ 未找到上游 tag"
+            exit 1
+          fi
+
+          echo "✅ 最新上游 tag: ${LATEST_TAG}"
+          echo "tag=${LATEST_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "url=${UPSTREAM_URL}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check if already up to date
+        run: |
+          LATEST_TAG="${{ steps.resolve_tag.outputs.tag }}"
+          CURRENT_TAG=$(git describe --tags --always 2>/dev/null || echo "none")
+          
+          if [ "$CURRENT_TAG" = "$LATEST_TAG" ]; then
+            echo "✅ 当前仓库已是最新版本 $LATEST_TAG，无需更新"
+            exit 0
+          fi
+          
+          echo "需要更新: 当前 $CURRENT_TAG → 最新 $LATEST_TAG"
+
+      - name: Backup current workflow file
+        run: |
+          BACKUP_DIR="/tmp/workflow-backup"
+
+          if [ ! -f "${WORKFLOW_FILE}" ]; then
+            echo "❌ 当前仓库中找不到 ${WORKFLOW_FILE}"
+            echo "请确认 workflow 文件路径正确"
+            exit 1
+          fi
+
+          rm -rf "${BACKUP_DIR}"
+          mkdir -p "${BACKUP_DIR}"
+
+          cp "${WORKFLOW_FILE}" "${BACKUP_DIR}/pull-cpa-upstream.yml"
+
+          echo "✅ 当前拉取 workflow 文件已备份"
+
+      - name: Export upstream latest tag snapshot
+        run: |
+          UPSTREAM_URL="${{ steps.resolve_tag.outputs.url }}"
+          LATEST_TAG="${{ steps.resolve_tag.outputs.tag }}"
+
+          echo "开始导出上游最新 tag 快照: ${UPSTREAM_REPO}@${LATEST_TAG}"
+
+          rm -rf /tmp/upstream-snapshot
+          mkdir -p /tmp/upstream-snapshot
+
+          git init /tmp/upstream-snapshot
+          cd /tmp/upstream-snapshot
+
+          git remote add upstream "${UPSTREAM_URL}"
+
+          # 这里只用于导出文件快照，不会把上游 Git 历史推送到当前仓库
+          git fetch --force --depth=1 upstream "refs/tags/${LATEST_TAG}:refs/tags/${LATEST_TAG}"
+          git checkout --detach "refs/tags/${LATEST_TAG}"
+
+          echo "✅ 上游最新 tag 快照已导出"
+          git show --no-patch --oneline "refs/tags/${LATEST_TAG}"
+
+      - name: Import snapshot into clean orphan branch
+        run: |
+          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          LATEST_TAG="${{ steps.resolve_tag.outputs.tag }}"
+          BACKUP_DIR="/tmp/workflow-backup"
+          IMPORT_BRANCH="snapshot-import-${GITHUB_RUN_ID}"
+
+          if [ -z "${TARGET_BRANCH}" ]; then
+            TARGET_BRANCH="main"
+          fi
+
+          echo "创建干净的快照导入分支，避免携带上游历史: ${IMPORT_BRANCH}"
+          git checkout --orphan "${IMPORT_BRANCH}"
+
+          echo "清理当前工作区，仅保留 .git 目录..."
+          find . -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
+
+          echo "复制上游最新 tag 的文件快照..."
+          rsync -a --delete --exclude=".git" /tmp/upstream-snapshot/ ./
+
+          echo "删除上游自带 workflow 文件..."
+          rm -rf .github/workflows
+
+          echo "恢复当前拉取 workflow 文件..."
+          mkdir -p .github/workflows
+          cp "${BACKUP_DIR}/pull-cpa-upstream.yml" "${WORKFLOW_FILE}"
+
+          echo "✅ 已导入快照，并仅恢复当前拉取 workflow 文件"
+
+      - name: Clean sensitive strings
+        run: |
+          echo "清理可能触发 GitHub Push Protection 的敏感字符串..."
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          # 需要跳过的目录
+          SKIP_DIRS = {
+              ".git",
+              "node_modules",
+              "vendor",
+              "dist",
+              "build",
+              ".next",
+              ".cache",
+          }
+
+          # 只处理常见文本文件，避免破坏二进制文件
+          TEXT_SUFFIXES = {
+              ".go", ".js", ".jsx", ".ts", ".tsx",
+              ".json", ".yaml", ".yml", ".toml", ".env",
+              ".md", ".txt", ".html", ".css", ".scss",
+              ".py", ".sh", ".bash", ".zsh",
+              ".java", ".kt", ".rs", ".php",
+              ".c", ".cpp", ".h", ".hpp",
+              ".xml", ".ini", ".conf",
+          }
+
+          # GitHub Push Protection 常见命中：Google OAuth Client ID / Secret
+          PATTERNS = [
+              (
+                  re.compile(r"[0-9]{6,}-[A-Za-z0-9_-]{20,}\.apps\.googleusercontent\.com"),
+                  "GOOGLE_OAUTH_CLIENT_ID_PLACEHOLDER",
+              ),
+              (
+                  re.compile(r"GOCSPX-[A-Za-z0-9_-]{20,}"),
+                  "GOOGLE_OAUTH_CLIENT_SECRET_PLACEHOLDER",
+              ),
+          ]
+
+          changed_files = []
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+
+              for filename in files:
+                  path = Path(root) / filename
+
+                  if path.suffix.lower() not in TEXT_SUFFIXES:
+                      continue
+
+                  try:
+                      data = path.read_text(encoding="utf-8")
+                  except UnicodeDecodeError:
+                      continue
+                  except OSError:
+                      continue
+
+                  original = data
+
+                  for pattern, replacement in PATTERNS:
+                      data = pattern.sub(replacement, data)
+
+                  if data != original:
+                      path.write_text(data, encoding="utf-8")
+                      changed_files.append(str(path))
+
+          if changed_files:
+              print("已清理以下文件中的敏感字符串：")
+              for item in changed_files:
+                  print(f"- {item}")
+          else:
+              print("未发现需要清理的敏感字符串")
+          PY
+
+          echo "✅ 敏感字符串清理完成"
+
+      - name: Generate neutral README
+        run: |
+          LATEST_TAG="${{ steps.resolve_tag.outputs.tag }}"
+
+          echo "生成中性的学习项目 README..."
+
+          {
+            printf '%s\n' '# Programming Study Notes'
+            printf '%s\n' ''
+            printf '%s\n' '这是一个用于学习编程和熟悉工程实践的个人项目。'
+            printf '%s\n' ''
+            printf '%s\n' '## 项目用途'
+            printf '%s\n' ''
+            printf '%s\n' '本项目主要用于：'
+            printf '%s\n' ''
+            printf '%s\n' '- 学习基础编程结构'
+            printf '%s\n' '- 熟悉项目目录组织方式'
+            printf '%s\n' '- 练习配置文件管理'
+            printf '%s\n' '- 了解自动化流程'
+            printf '%s\n' '- 记录个人学习过程'
+            printf '%s\n' ''
+            printf '%s\n' '## 当前版本'
+            printf '%s\n' ''
+            printf '%s\n' "当前同步版本：${LATEST_TAG}"
+            printf '%s\n' ''
+            printf '%s\n' '## 学习内容'
+            printf '%s\n' ''
+            printf '%s\n' '可以通过本项目了解以下内容：'
+            printf '%s\n' ''
+            printf '%s\n' '- 代码仓库的基本结构'
+            printf '%s\n' '- 配置文件的组织方式'
+            printf '%s\n' '- 自动化任务的执行流程'
+            printf '%s\n' '- 日志查看和问题排查'
+            printf '%s\n' '- 版本记录和变更管理'
+            printf '%s\n' ''
+            printf '%s\n' '## 注意事项'
+            printf '%s\n' ''
+            printf '%s\n' '本仓库仅用于个人学习和技术实践。'
+            printf '%s\n' ''
+            printf '%s\n' '请不要在仓库中提交任何敏感信息，例如：'
+            printf '%s\n' ''
+            printf '%s\n' '- 密码'
+            printf '%s\n' '- Token'
+            printf '%s\n' '- 私钥'
+            printf '%s\n' '- 账号信息'
+            printf '%s\n' '- 个人隐私数据'
+            printf '%s\n' ''
+            printf '%s\n' '## 维护说明'
+            printf '%s\n' ''
+            printf '%s\n' '后续可以根据学习进度继续补充：'
+            printf '%s\n' ''
+            printf '%s\n' '- 学习笔记'
+            printf '%s\n' '- 配置说明'
+            printf '%s\n' '- 运行记录'
+            printf '%s\n' '- 问题总结'
+            printf '%s\n' '- 改进计划'
+          } > README.md
+
+          echo "✅ README.md 已更新为学习项目说明"
+
+      - name: Commit cleaned snapshot
+        id: commit
+        run: |
+          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          LATEST_TAG="${{ steps.resolve_tag.outputs.tag }}"
+
+          if [ -z "${TARGET_BRANCH}" ]; then
+            TARGET_BRANCH="main"
+          fi
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "没有检测到文件变化，无需提交"
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            git commit -m "chore: update programming study snapshot ${LATEST_TAG}"
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+          git branch -M "${TARGET_BRANCH}"
+
+          echo "target_branch=${TARGET_BRANCH}" >> "${GITHUB_OUTPUT}"
+
+      - name: Push clean branch and cleaned tag
+        run: |
+          TARGET_BRANCH="${{ steps.commit.outputs.target_branch }}"
+          LATEST_TAG="${{ steps.resolve_tag.outputs.tag }}"
+
+          echo "创建/更新当前仓库同名 tag，指向清理后的快照提交: ${LATEST_TAG}"
+          git tag -d "${LATEST_TAG}" 2>/dev/null || true
+          git tag -f -a "${LATEST_TAG}" -m "Programming study snapshot ${LATEST_TAG}" HEAD
+
+          echo "强制推送干净快照到当前私有仓库分支: ${TARGET_BRANCH}"
+          git push origin "HEAD:${TARGET_BRANCH}" --force
+
+          echo "推送清理后的同名 tag 到当前私有仓库: ${LATEST_TAG}"
+          git push origin "refs/tags/${LATEST_TAG}:refs/tags/${LATEST_TAG}" --force
+
+          echo "✅ 干净分支和清理后的 tag 推送完成"
+
+      - name: Summary
+        run: |
+          echo "========================================"
+          echo "项目: Programming Study Notes"
+          echo "当前版本: ${{ steps.resolve_tag.outputs.tag }}"
+          echo "目标分支: ${{ steps.commit.outputs.target_branch }}"
+          echo "是否有文件变化: ${{ steps.commit.outputs.changed }}"
+          echo "导入方式: 快照导入，不携带上游 Git 历史"
+          echo "========================================"
+          echo "✅ 已完成学习项目快照更新"
